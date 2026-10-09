@@ -1,0 +1,119 @@
+import type { FastifyInstance } from 'fastify'
+import { computeTWAP, computeVWAP } from '../pricing/twap'
+import { z } from 'zod'
+
+const TwapQuerySchema = z.object({
+  window: z.coerce.number().int().min(1).max(1440).default(60),
+  sampleInterval: z.coerce.number().int().min(1).max(3600).default(60),
+  method: z.enum(['iqr', 'modified_zscore']).default('iqr'),
+})
+
+const VwapQuerySchema = z.object({
+  window: z.coerce.number().int().min(1).max(1440).default(60),
+  source: z.enum(['SDEX', 'AMM']).optional(),
+  method: z.enum(['iqr', 'modified_zscore']).default('iqr'),
+})
+
+/**
+ * Register manipulation-resistant TWAP/VWAP pricing endpoints.
+ *
+ * GET /price/twap/:assetA/:assetB?window=60&sampleInterval=60&method=iqr
+ * GET /price/vwap/:assetA/:assetB?window=60&source=&method=iqr
+ */
+export async function registerPriceRoutes(app: FastifyInstance) {
+  // ─── TWAP ────────────────────────────────────────────────────────────────────
+  app.get<{
+    Params: { assetA: string; assetB: string }
+    Querystring: {
+      window?: string
+      sampleInterval?: string
+      method?: 'iqr' | 'modified_zscore'
+    }
+  }>(
+    '/price/twap/:assetA/:assetB',
+    async (req, reply) => {
+      const { assetA, assetB } = req.params
+      const parsed = TwapQuerySchema.safeParse(req.query)
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.issues[0].message || 'Invalid parameters' })
+      }
+      const { window: windowMinutes, sampleInterval, method } = parsed.data
+
+      const pairKey = [assetA, assetB].sort().join('/')
+
+      try {
+        const result = await computeTWAP(pairKey, windowMinutes, {
+          sampleIntervalSeconds: sampleInterval,
+          outlierMethod: method,
+        })
+
+        return {
+          assetA,
+          assetB,
+          pairKey,
+          twap: result.twap,
+          windowMinutes,
+          sampleIntervalSeconds: sampleInterval,
+          startTime: result.startTime,
+          endTime: result.endTime,
+          sampleCount: result.sampleCount,
+          outlierRejected: result.outlierRejected,
+          filterMethod: result.filterMethod,
+        }
+      } catch (err) {
+        // A driver error message can carry the connection string, and so the
+        // Postgres credentials. Log it; never put it in the response body.
+        console.error('[price] TWAP computation failed:', (err as Error).message)
+        return reply.status(500).send({ error: 'TWAP computation failed' })
+      }
+    }
+  )
+
+  // ─── VWAP ────────────────────────────────────────────────────────────────────
+  app.get<{
+    Params: { assetA: string; assetB: string }
+    Querystring: {
+      window?: string
+      source?: 'SDEX' | 'AMM'
+      method?: 'iqr' | 'modified_zscore'
+    }
+  }>(
+    '/price/vwap/:assetA/:assetB',
+    async (req, reply) => {
+      const { assetA, assetB } = req.params
+      const parsed = VwapQuerySchema.safeParse(req.query)
+      if (!parsed.success) {
+        return reply.status(400).send({ error: parsed.error.issues[0].message || 'Invalid parameters' })
+      }
+      const { window: windowMinutes, source, method } = parsed.data
+
+      const pairKey = [assetA, assetB].sort().join('/')
+
+      try {
+        const result = await computeVWAP(pairKey, windowMinutes, {
+          source,
+          outlierMethod: method,
+        })
+
+        return {
+          assetA,
+          assetB,
+          pairKey,
+          vwap: result.vwap,
+          windowMinutes,
+          source: source ?? 'all',
+          startTime: result.startTime,
+          endTime: result.endTime,
+          sampleCount: result.sampleCount,
+          volumeTotal: result.volumeTotal,
+          outlierRejected: result.outlierRejected,
+          filterMethod: result.filterMethod,
+        }
+      } catch (err) {
+        // Same as TWAP above: the driver message can contain credentials.
+        console.error('[price] VWAP computation failed:', (err as Error).message)
+        return reply.status(500).send({ error: 'VWAP computation failed' })
+      }
+    }
+  )
+}
