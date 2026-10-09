@@ -1,7 +1,7 @@
 {
   "openapi": "3.0.0",
   "info": {
-    "title": "lens-analytics-analytics API",
+    "title": "LensAnalytics API",
     "description": "Unified Stellar price API aggregating SDEX + AMM prices.",
     "version": "0.1.0",
     "license": {
@@ -1056,7 +1056,7 @@
     "/compare/{asset}": {
       "get": {
         "operationId": "compareAsset",
-        "summary": "Compare lens-analytics-analytics and Reflector oracle prices for an asset",
+        "summary": "Compare LensAnalytics and Reflector oracle prices for an asset",
         "security": [],
         "parameters": [
           {
@@ -1362,7 +1362,7 @@
             "name": "network",
             "in": "query",
             "required": false,
-            "description": "Catalog filter matching the resource's payment network. Accepts either the lens-analytics-analytics network name (`mainnet`/`testnet`) or the CAIP-2 id (`stellar:pubnet`/`stellar:testnet`).",
+            "description": "Catalog filter matching the resource's payment network. Accepts either the LensAnalytics network name (`mainnet`/`testnet`) or the CAIP-2 id (`stellar:pubnet`/`stellar:testnet`).",
             "schema": {
               "type": "string"
             }
@@ -2364,7 +2364,7 @@
         "type": "object",
         "required": [
           "asset",
-          "lens-analytics-analytics",
+          "lens-analytics",
           "reflector",
           "deviationPct",
           "status",
@@ -2375,7 +2375,7 @@
           "asset": {
             "type": "string"
           },
-          "lens-analytics-analytics": {
+          "lens-analytics": {
             "type": "number",
             "nullable": true
           },
