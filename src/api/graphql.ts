@@ -1,0 +1,234 @@
+import type { FastifyInstance } from 'fastify'
+import { price_requests_total } from '../metrics'
+import mercurius, { withFilter, type MercuriusContext } from 'mercurius'
+import { getCachedPrice } from '../redis'
+import { getAggregatedPrice } from '../aggregator/vwap'
+import { getBestRoute } from '../aggregator/bestRoute'
+import { pgPool } from '../db'
+import { config, activeNetwork } from '../config'
+import { priceEmitter, PRICE_PUBLISHED, type PricePublishedEvent } from '../events'
+
+// Mercurius pubsub topic that carries every new price. A single app-level
+// listener bridges the ingesters' in-process `priceEmitter` onto this topic;
+// each subscriber then filters it down to the pair they asked for.
+const PRICE_TOPIC = 'PRICE_UPDATED'
+
+const schema = `
+  type AggregatedPrice {
+    assetA: String!
+    assetB: String!
+    pairKey: String!
+    price: Float!
+    sdexPrice: Float!
+    ammPrice: Float!
+    bestRoute: String!
+    volume24h: Float!
+    sdexVolume24h: Float!
+    ammVolume24h: Float!
+    vwap1m: Float!
+    vwap5m: Float!
+    vwap1h: Float!
+    vwap24h: Float!
+    priceChange24h: Float!
+    lastUpdated: String!
+    sources: Int!
+    confidence: String!
+    lastTradeAgeSeconds: Int
+  }
+
+  type RouteInfo {
+    route: String!
+    sdexPrice: Float!
+    ammPrice: Float!
+    estimatedOutput: Float!
+    slippagePct: Float!
+    recommendation: String!
+  }
+
+  type PriceBucket {
+    bucket: String!
+    window: String!
+    vwap: Float!
+    sdexVwap: Float
+    ammVwap: Float
+    volume: Float!
+    tradeCount: Int!
+    open: Float
+    close: Float
+    high: Float
+    low: Float
+  }
+
+  type PriceUpdate {
+    pair: String!
+    price: Float!
+    ts: String!
+    """Which chain the price came from — testnet or mainnet."""
+    network: String!
+  }
+
+  type Query {
+    getPrice(assetA: String!, assetB: String!): AggregatedPrice
+    getBestRoute(assetA: String!, assetB: String!, amount: Float!): RouteInfo
+    getPriceHistory(assetA: String!, assetB: String!, window: String!, limit: Int): [PriceBucket]
+    listPairs: [String]!
+  }
+
+  type Subscription {
+    """
+    Streams a PriceUpdate every time an ingester records a new price for the
+    given pair.
+
+    The network argument narrows the stream to one chain. It is optional, and
+    omitting it delivers every enabled network — the right default only if you
+    read the network field on each message, since a dual-network deployment
+    otherwise interleaves two chains prices on one stream.
+    """
+    priceUpdated(pair: String!, network: String): PriceUpdate!
+  }
+`
+
+function makePairKey(a: string, b: string): string {
+  return [a, b].sort().join('/')
+}
+
+function findPair(assetA: string, assetB: string) {
+  const normalize = (a: string) => a.toLowerCase() === 'native' ? 'XLM' : a.split(':')[0].toUpperCase()
+  const cA = normalize(assetA)
+  const cB = normalize(assetB)
+  return config.pairs.find(p => {
+    const pA = p.assetA.code.toUpperCase()
+    const pB = p.assetB.code.toUpperCase()
+    return (cA === pA && cB === pB) || (cA === pB && cB === pA)
+  })
+}
+
+const resolvers = {
+  Query: {
+    async getPrice(_: unknown, { assetA, assetB }: { assetA: string; assetB: string }) {
+      price_requests_total.inc()
+      const pair = findPair(assetA, assetB)
+      if (!pair) return null
+      const pairKey = pair.pairKey
+
+      // These queries carry no network argument, so they resolve against the
+      // active network's pair list (findPair above) and read that same
+      // network's price data — scoped, not pooled across both chains.
+      // Per-request network selection on the GraphQL surface is separate work.
+      // The cache key is network-prefixed to match the REST route and the
+      // refresh worker, so no deployment can serve another network's cached
+      // payload under a network-less key.
+      const cacheKey = `${activeNetwork}:${pairKey}`
+      const cached = await getCachedPrice(cacheKey)
+      if (cached) {
+        try { return JSON.parse(cached) } catch { /* fall through */ }
+      }
+
+      const agg = await getAggregatedPrice(pairKey, activeNetwork)
+      const route = await getBestRoute(pair.assetA, pair.assetB, pairKey, 1000, activeNetwork)
+      return {
+        assetA, assetB, pairKey, ...agg,
+        bestRoute: route.route,
+        lastUpdated: new Date().toISOString(),
+      }
+    },
+
+    async getBestRoute(
+      _: unknown,
+      { assetA, assetB, amount }: { assetA: string; assetB: string; amount: number }
+    ) {
+      const pair = findPair(assetA, assetB)
+      if (!pair) return null
+      return getBestRoute(pair.assetA, pair.assetB, pair.pairKey, amount)
+    },
+
+    async getPriceHistory(
+      _: unknown,
+      { assetA, assetB, window, limit = 100 }: { assetA: string; assetB: string; window: string; limit?: number }
+    ) {
+      const pairKey = makePairKey(assetA, assetB)
+      const result = await pgPool.query(
+        `SELECT bucket, window, vwap::float, sdex_vwap::float, amm_vwap::float,
+                volume::float, trade_count, open_price::float, close_price::float,
+                high_price::float, low_price::float
+         FROM price_aggregates
+         WHERE pair_key = $1 AND window = $2
+         ORDER BY bucket DESC
+         LIMIT $3`,
+        [pairKey, window, Math.min(limit, 1000)]
+      )
+      return result.rows.map(r => ({
+        bucket: r.bucket.toISOString(),
+        window: r.window,
+        vwap: r.vwap,
+        sdexVwap: r.sdex_vwap,
+        ammVwap: r.amm_vwap,
+        volume: r.volume,
+        tradeCount: r.trade_count,
+        open: r.open_price,
+        close: r.close_price,
+        high: r.high_price,
+        low: r.low_price,
+      }))
+    },
+
+    listPairs() {
+      return config.pairs.map(p => p.pairKey)
+    },
+  },
+
+  Subscription: {
+    priceUpdated: {
+      subscribe: withFilter<
+        { priceUpdated: PricePublishedEvent },
+        unknown,
+        MercuriusContext,
+        { pair: string; network?: string | null }
+      >(
+        (_root, _args, { pubsub }) => pubsub.subscribe(PRICE_TOPIC),
+        // Both loops publish to one topic, so the network filter has to happen
+        // here. Omitting `network` keeps every chain — the message carries its
+        // own `network` field, so the subscriber can still tell them apart.
+        (payload, { pair, network }) =>
+          payload.priceUpdated.pair === pair &&
+          // == null, not === undefined: a client that passes the variable
+          // explicitly sends null rather than omitting it, and both mean
+          // "every network". Comparing against undefined alone would filter
+          // out every message for those clients.
+          (network == null || payload.priceUpdated.network === network)
+      ),
+    },
+  },
+}
+
+export async function registerGraphQL(app: FastifyInstance) {
+  await app.register(mercurius, {
+    schema,
+    resolvers,
+    graphiql: true,
+    path: '/graphql',
+    subscription: {
+      // Speak the `graphql-transport-ws` subprotocol (the modern `graphql-ws`
+      // library) rather than the legacy `subscriptions-transport-ws`.
+      fullWsTransport: true,
+      wsDefaultSubprotocol: 'graphql-transport-ws',
+    },
+  })
+
+  // Bridge: forward every price the ingesters emit onto the GraphQL pubsub
+  // topic. Mercurius wraps the payload under the subscription field name so
+  // `withFilter` and the resolver receive `{ priceUpdated: <event> }`.
+  const onPricePublished = (event: PricePublishedEvent) => {
+    app.graphql.pubsub.publish({
+      topic: PRICE_TOPIC,
+      payload: { priceUpdated: event },
+    })
+  }
+  priceEmitter.on(PRICE_PUBLISHED, onPricePublished)
+
+  // Detach the listener when the server shuts down so repeated
+  // register/close cycles (e.g. in tests) don't leak listeners.
+  app.addHook('onClose', async () => {
+    priceEmitter.off(PRICE_PUBLISHED, onPricePublished)
+  })
+}
